@@ -96,10 +96,12 @@ public class ZooKeeperServerMain {
             LOG.warn("Unable to register log4j JMX control", e);
         }
 
+        // 如果入参只有一个，则认为是配置文件的路径。
         ServerConfig config = new ServerConfig();
         if (args.length == 1) {
             config.parse(args[0]);
         } else {
+            // 否则是各个参数。
             config.parse(args);
         }
 
@@ -121,7 +123,9 @@ public class ZooKeeperServerMain {
             // so rather than spawning another thread, we will just call
             // run() in this thread.
             // create a file logger url from the command line args
+            // 初始化日志文件。
             txnLog = new FileTxnSnapLog(config.dataLogDir, config.dataDir);
+            // 初始化 ZkServer 对象。
             final ZooKeeperServer zkServer = new ZooKeeperServer(txnLog,
                     config.tickTime, config.minSessionTimeout, config.maxSessionTimeout, null);
 
@@ -138,8 +142,11 @@ public class ZooKeeperServerMain {
 
             boolean needStartZKServer = true;
             if (config.getClientPortAddress() != null) {
+                // 初始化 server 端IO对象，默认是 NIOServerCnxnFactory。
                 cnxnFactory = ServerCnxnFactory.createFactory();
+                // 初始化配置信息。
                 cnxnFactory.configure(config.getClientPortAddress(), config.getMaxClientCnxns(), false);
+                // 启动服务
                 cnxnFactory.startup(zkServer);
                 // zkServer has been started. So we don't need to start it again in secureCnxnFactory.
                 needStartZKServer = false;
@@ -150,6 +157,10 @@ public class ZooKeeperServerMain {
                 secureCnxnFactory.startup(zkServer, needStartZKServer);
             }
 
+            /*
+            container ZNodes是3.6版本之后新增的节点类型， Container类型的节点会在它没有⼦节点时
+            被删除（新创建的Container节点除外），该类就是⽤来周期性的进⾏检查清理⼯作。
+             */
             containerManager = new ContainerManager(zkServer.getZKDatabase(), zkServer.firstProcessor,
                     Integer.getInteger("znode.container.checkIntervalMs", (int) TimeUnit.MINUTES.toMillis(1)),
                     Integer.getInteger("znode.container.maxPerMinute", 10000)

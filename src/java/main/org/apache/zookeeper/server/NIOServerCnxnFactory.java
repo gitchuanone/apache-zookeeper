@@ -646,16 +646,20 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         configureSaslLogin();
 
         maxClientCnxns = maxcc;
+        // 会话超时时间。
         sessionlessCnxnTimeout = Integer.getInteger(
             ZOOKEEPER_NIO_SESSIONLESS_CNXN_TIMEOUT, 10000);
         // We also use the sessionlessCnxnTimeout as expiring interval for
         // cnxnExpiryQueue. These don't need to be the same, but the expiring
         // interval passed into the ExpiryQueue() constructor below should be
         // less than or equal to the timeout.
+        // 过期队列。
         cnxnExpiryQueue =
             new ExpiryQueue<NIOServerCnxn>(sessionlessCnxnTimeout);
+        // 过期线程，从cnxnExpiryQueue中读取数据，如果已经过期则关闭。
         expirerThread = new ConnectionExpirerThread();
 
+        // 根据CPU个数计算selector线程的数量。
         int numCores = Runtime.getRuntime().availableProcessors();
         // 32 cores sweet spot seems to be 4 selector threads
         numSelectorThreads = Integer.getInteger(
@@ -665,8 +669,10 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             throw new IOException("numSelectorThreads must be at least 1");
         }
 
+        // 计算worker线程的数量。
         numWorkerThreads = Integer.getInteger(
             ZOOKEEPER_NIO_NUM_WORKER_THREADS, 2 * numCores);
+        // worker线程关闭时间。
         workerShutdownTimeoutMS = Long.getLong(
             ZOOKEEPER_NIO_SHUTDOWN_TIMEOUT, 5000);
 
@@ -677,6 +683,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                  + " worker threads, and "
                  + (directBufferBytes == 0 ? "gathered writes." :
                     ("" + (directBufferBytes/1024) + " kB direct buffers.")));
+        // 初始化selector线程。
         for(int i=0; i<numSelectorThreads; ++i) {
             selectorThreads.add(new SelectorThread(i));
         }
@@ -686,6 +693,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         LOG.info("binding to port " + addr);
         ss.socket().bind(addr);
         ss.configureBlocking(false);
+        // 初始化accept线程，只有一个，里面会注册监听Accept事件。
         acceptThread = new AcceptThread(ss, addr, selectorThreads);
     }
 
@@ -737,24 +745,29 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     @Override
     public void start() {
         stopped = false;
+        // 初始化worker线程池。
         if (workerPool == null) {
             workerPool = new WorkerService(
                 "NIOWorker", numWorkerThreads, false);
         }
+        // 挨个启动select线程。
         for(SelectorThread thread : selectorThreads) {
             if (thread.getState() == Thread.State.NEW) {
                 thread.start();
             }
         }
         // ensure thread is started once and only once
+        // 启动 acceptThread 线程。
         if (acceptThread.getState() == Thread.State.NEW) {
             acceptThread.start();
         }
+        // 启动 expirerThread 线程。
         if (expirerThread.getState() == Thread.State.NEW) {
             expirerThread.start();
         }
     }
 
+    // 启动分了好几块，一个一个看。
     @Override
     public void startup(ZooKeeperServer zks, boolean startServer)
             throws IOException, InterruptedException {

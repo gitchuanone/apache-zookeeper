@@ -434,22 +434,30 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         }
     }
 
+    // 初始化数据结构。
     public void startdata()
     throws IOException, InterruptedException {
         //check to see if zkDb is not null
+        // 初始化ZKDatabase，该数据结构用来保存zk上面存储的所有数据。
         if (zkDb == null) {
+            // 初始化数据，这里会加入一些原始节点，例如/zookeeper。
             zkDb = new ZKDatabase(this.txnLogFactory);
         }
+        // 加载磁盘上已经存储的数据，如果有的话。
         if (!zkDb.isInitialized()) {
             loadData();
         }
     }
 
+    // 启动剩余项目。
     public synchronized void startup() {
+        // 初始化session追踪器。
         if (sessionTracker == null) {
             createSessionTracker();
         }
+        // 启动session追踪器。
         startSessionTracker();
+        // 建立请求处理链路。
         setupRequestProcessors();
 
         registerJMX();
@@ -458,6 +466,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         notifyAll();
     }
 
+    // 这⾥可以看出，单机模式下请求的处理链路为：PrepRequestProcessor -> SyncRequestProcessor -> FinalRequestProcessor。
     protected void setupRequestProcessors() {
         RequestProcessor finalProcessor = new FinalRequestProcessor(this);
         RequestProcessor syncProcessor = new SyncRequestProcessor(this,
