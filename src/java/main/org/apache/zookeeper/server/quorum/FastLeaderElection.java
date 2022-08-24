@@ -886,12 +886,15 @@ public class FastLeaderElection implements Election {
             int notTimeout = finalizeWait;
 
             synchronized(this){
+                // 首先会将逻辑时钟自增，每进行一轮新的 leader 选举，都需要更新新逻辑时钟。
                 logicalclock.incrementAndGet();
+                // 更新选票（初始化选票）。
                 updateProposal(getInitId(), getInitLastLoggedZxid(), getPeerEpoch());
             }
 
             LOG.info("New election. My id =  " + self.getId() +
                     ", proposed zxid=0x" + Long.toHexString(proposedZxid));
+            // 向其他服务器发送自己的选票（已更新的选票）。
             sendNotifications();
 
             /*
@@ -904,6 +907,7 @@ public class FastLeaderElection implements Election {
                  * Remove next notification from queue, times out after 2 times
                  * the termination time
                  */
+                // 从 recvqueue 接受队列中取出投票。
                 Notification n = recvqueue.poll(notTimeout,
                         TimeUnit.MILLISECONDS);
 
@@ -911,10 +915,14 @@ public class FastLeaderElection implements Election {
                  * Sends more notifications if haven't received enough.
                  * Otherwise processes new notification.
                  */
+                // 无法获取选票。
                 if(n == null){
+                    // manager 已经发送了所有的选票信息（表示有连接）。
                     if(manager.haveDelivered()){
+                        // 向其他服务器发送消息。
                         sendNotifications();
                     } else {
+                        // 还未发送所有消息（表示无连接）。连接到其他每个服务器。
                         manager.connectAll();
                     }
 
@@ -934,19 +942,26 @@ public class FastLeaderElection implements Election {
                     switch (n.state) {
                     case LOOKING:
                         // If notification > current, replace and send messages out
+                        // 其选举周期大于逻辑时钟。
                         if (n.electionEpoch > logicalclock.get()) {
+                            // 重新赋值逻辑时钟。
                             logicalclock.set(n.electionEpoch);
+                            // 清空所有接收到的所有选票。
                             recvset.clear();
+                            // 进行pk，选出较优的服务器。
                             if(totalOrderPredicate(n.leader, n.zxid, n.peerEpoch,
                                     getInitId(), getInitLastLoggedZxid(), getPeerEpoch())) {
+                                // 更新选票。
                                 updateProposal(n.leader, n.zxid, n.peerEpoch);
                             } else {
+                                // 无法选出较优的服务器。更新选票。
                                 updateProposal(getInitId(),
                                         getInitLastLoggedZxid(),
                                         getPeerEpoch());
                             }
+                            // 发送本服务器的内部选票消息。
                             sendNotifications();
-                        } else if (n.electionEpoch < logicalclock.get()) {
+                        } else if (n.electionEpoch < logicalclock.get()) { // 选举周期小于逻辑时钟，不作处理，直接忽略。
                             if(LOG.isDebugEnabled()){
                                 LOG.debug("Notification election epoch is smaller than logicalclock. n.electionEpoch = 0x"
                                         + Long.toHexString(n.electionEpoch)
@@ -954,8 +969,10 @@ public class FastLeaderElection implements Election {
                             }
                             break;
                         } else if (totalOrderPredicate(n.leader, n.zxid, n.peerEpoch,
-                                proposedLeader, proposedZxid, proposedEpoch)) {
+                                proposedLeader, proposedZxid, proposedEpoch)) { // pk选出较优服务器。
+                            // 更新选票。
                             updateProposal(n.leader, n.zxid, n.peerEpoch);
+                            // 发送消息。
                             sendNotifications();
                         }
 
@@ -966,15 +983,19 @@ public class FastLeaderElection implements Election {
                                     ", proposed election epoch=0x" + Long.toHexString(n.electionEpoch));
                         }
 
+                        // recvset用于记录当前服务器在本轮次的leader选举中收到的所有外部投票。
                         recvset.put(n.sid, new Vote(n.leader, n.zxid, n.electionEpoch, n.peerEpoch));
 
+                        // 若能选出leader。
                         if (termPredicate(recvset,
                                 new Vote(proposedLeader, proposedZxid,
                                         logicalclock.get(), proposedEpoch))) {
 
                             // Verify if there is any change in the proposed leader
+                            // 遍历已经收到的投票集合。
                             while((n = recvqueue.poll(finalizeWait,
                                     TimeUnit.MILLISECONDS)) != null){
+                                // 选票有变更，比之前提议的leader有更好的选票加入，将更优的选票放在recvset中。
                                 if(totalOrderPredicate(n.leader, n.zxid, n.peerEpoch,
                                         proposedLeader, proposedZxid, proposedEpoch)){
                                     recvqueue.put(n);
@@ -986,13 +1007,18 @@ public class FastLeaderElection implements Election {
                              * This predicate is true once we don't read any new
                              * relevant message from the reception queue
                              */
+                            // 表示之前提议的leader已经是最优的。
                             if (n == null) {
+                                // 设置服务器状态。
                                 self.setPeerState((proposedLeader == self.getId()) ?
                                         ServerState.LEADING: learningState());
 
+                                // 最终的选票。
                                 Vote endVote = new Vote(proposedLeader,
                                         proposedZxid, proposedEpoch);
+                                // 清空 recvqueue 队列的选票。
                                 leaveInstance(endVote);
+                                // 返回选票。
                                 return endVote;
                             }
                         }
