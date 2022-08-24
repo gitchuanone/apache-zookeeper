@@ -508,3 +508,305 @@ FastLeaderElection.totalOrderPredicate 方法的核心逻辑。选票PK的目的
 
 
 
+
+
+
+
+
+
+### 集群模式服务端  
+
+执行流程流程
+
+![](./imgs/5-3-服务器-集群服务器启动.png)
+
+**源码分析**
+
+集群模式下启动所有的ZK节点启动⼊⼝都是 QuorumPeerMain 类的 main ⽅法。 main ⽅法加载配置文件以后，最终会调用到 QuorumPeer的start ⽅法。 
+
+org.apache.zookeeper.server.quorum.QuorumPeer#start
+
+```java
+@Override
+    public synchronized void start() {
+        // 校验ServerId是否合法。
+        if (!getView().containsKey(myid)) {
+            throw new RuntimeException("My id " + myid + " not in the peer list");
+         }
+        // 载入之前持久化一些信息。
+        loadDataBase();
+        // 启动线程监听。
+        startServerCnxnFactory();
+        try {
+            adminServer.start();
+        } catch (AdminServerException e) {
+            LOG.warn("Problem starting AdminServer", e);
+            System.out.println(e);
+        }
+        // 初始化选举投票以及算法。
+        startLeaderElection();
+        // 当前也是一个线程。注意run方法。
+        super.start();
+    }
+```
+
+当⼀个节点启动时需要先发起选举寻找 Leader 节点，然后再根据 Leader 节点的事务信息进行同步，最后开始对外提供服务，先来看下初始化选举的逻辑，即上面的 startLeaderElection 方法：  
+
+```java
+synchronized public void startLeaderElection() {
+       try {
+           // 所有节点启动的初始状态都是Looking，这里会创建一张投自己的选票。
+           if (getPeerState() == ServerState.LOOKING) {
+               currentVote = new Vote(myid, getLastLoggedZxid(), getCurrentEpoch());
+           }
+       } catch(IOException e) {
+           RuntimeException re = new RuntimeException(e.getMessage());
+           re.setStackTrace(e.getStackTrace());
+           throw re;
+       }
+
+       // if (!getView().containsKey(myid)) {
+      //      throw new RuntimeException("My id " + myid + " not in the peer list");
+        //}
+        if (electionType == 0) {
+            try {
+                udpSocket = new DatagramSocket(myQuorumAddr.getPort());
+                responder = new ResponderThread();
+                responder.start();
+            } catch (SocketException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        // 初始化选举算法，electionType 默认为3。
+        this.electionAlg = createElectionAlgorithm(electionType);
+    }
+
+	@SuppressWarnings("deprecation")
+    protected Election createElectionAlgorithm(int electionAlgorithm){
+        Election le=null;
+
+        //TODO: use a factory rather than a switch
+        switch (electionAlgorithm) {
+        case 0:
+            le = new LeaderElection(this);
+            break;
+        case 1:
+            le = new AuthFastLeaderElection(this);
+            break;
+        case 2:
+            le = new AuthFastLeaderElection(this, true);
+            break;
+        case 3:
+            // electionAlgorithm 默认是3。
+            qcm = createCnxnManager();
+            // 监听选举事件的 listener。
+            QuorumCnxManager.Listener listener = qcm.listener;
+            if(listener != null){
+                // 开启监听器。
+                listener.start();
+                // 初始化选举算法。
+                FastLeaderElection fle = new FastLeaderElection(this, qcm);
+                // 发起选举。
+                fle.start();
+                le = fle;
+            } else {
+                LOG.error("Null listener when initializing cnx manager");
+            }
+            break;
+        default:
+            assert false;
+        }
+        return le;
+    }
+
+```
+
+回到 QuorumPeer 类中 start 方法的最后⼀行 super.start()， QuorumPeer 本身也是⼀个线程类，⼀起来看下它的run方法，org.apache.zookeeper.server.quorum.QuorumPeer#run 
+
+```java
+@Override
+    public void run() {
+        updateThreadName();
+
+        LOG.debug("Starting quorum peer");
+        try {
+            jmxQuorumBean = new QuorumBean(this);
+            MBeanRegistry.getInstance().register(jmxQuorumBean, null);
+            for(QuorumServer s: getView().values()){
+                ZKMBeanInfo p;
+                if (getId() == s.id) {
+                    p = jmxLocalPeerBean = new LocalPeerBean(this);
+                    try {
+                        MBeanRegistry.getInstance().register(p, jmxQuorumBean);
+                    } catch (Exception e) {
+                        LOG.warn("Failed to register with JMX", e);
+                        jmxLocalPeerBean = null;
+                    }
+                } else {
+                    RemotePeerBean rBean = new RemotePeerBean(s);
+                    try {
+                        MBeanRegistry.getInstance().register(rBean, jmxQuorumBean);
+                        jmxRemotePeerBean.put(s.id, rBean);
+                    } catch (Exception e) {
+                        LOG.warn("Failed to register with JMX", e);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to register with JMX", e);
+            jmxQuorumBean = null;
+        }
+
+        try {
+            /*
+             * Main loop
+             */
+            while (running) {
+                // 根据当前节点的状态执行不同的流程。
+                switch (getPeerState()) {
+                case LOOKING:
+                    LOG.info("LOOKING");
+
+                    if (Boolean.getBoolean("readonlymode.enabled")) {
+                        LOG.info("Attempting to start ReadOnlyZooKeeperServer");
+
+                        // Create read-only server but don't start it immediately
+                        final ReadOnlyZooKeeperServer roZk =
+                            new ReadOnlyZooKeeperServer(logFactory, this, this.zkDb);
+    
+                        // Instead of starting roZk immediately, wait some grace
+                        // period before we decide we're partitioned.
+                        //
+                        // Thread is used here because otherwise it would require
+                        // changes in each of election strategy classes which is
+                        // unnecessary code coupling.
+                        Thread roZkMgr = new Thread() {
+                            public void run() {
+                                try {
+                                    // lower-bound grace period to 2 secs
+                                    sleep(Math.max(2000, tickTime));
+                                    if (ServerState.LOOKING.equals(getPeerState())) {
+                                        roZk.startup();
+                                    }
+                                } catch (InterruptedException e) {
+                                    LOG.info("Interrupted while attempting to start ReadOnlyZooKeeperServer, not started");
+                                } catch (Exception e) {
+                                    LOG.error("FAILED to start ReadOnlyZooKeeperServer", e);
+                                }
+                            }
+                        };
+                        try {
+                            roZkMgr.start();
+                            reconfigFlagClear();
+                            if (shuttingDownLE) {
+                                shuttingDownLE = false;
+                                startLeaderElection();
+                            }
+                            // 寻找leader节点。
+                            setCurrentVote(makeLEStrategy().lookForLeader());
+                        } catch (Exception e) {
+                            LOG.warn("Unexpected exception", e);
+                            setPeerState(ServerState.LOOKING);
+                        } finally {
+                            // If the thread is in the the grace period, interrupt
+                            // to come out of waiting.
+                            roZkMgr.interrupt();
+                            roZk.shutdown();
+                        }
+                    } else {
+                        try {
+                           reconfigFlagClear();
+                            if (shuttingDownLE) {
+                               shuttingDownLE = false;
+                               startLeaderElection();
+                               }
+                            setCurrentVote(makeLEStrategy().lookForLeader());
+                        } catch (Exception e) {
+                            LOG.warn("Unexpected exception", e);
+                            setPeerState(ServerState.LOOKING);
+                        }                        
+                    }
+                    break;
+                case OBSERVING:
+                    try {
+                        LOG.info("OBSERVING");
+                        // 当前节点启动模式为Observer。
+                        setObserver(makeObserver(logFactory));
+                        // 与leader节点进行数据同步。
+                        observer.observeLeader();
+                    } catch (Exception e) {
+                        LOG.warn("Unexpected exception",e );
+                    } finally {
+                        observer.shutdown();
+                        setObserver(null);  
+                       updateServerState();
+                    }
+                    break;
+                case FOLLOWING:
+                    try {
+                       LOG.info("FOLLOWING");
+                       // 当前节点启动模式是Follower。
+                        setFollower(makeFollower(logFactory));
+                        // 与leader节点进行数据同步。
+                        follower.followLeader();
+                    } catch (Exception e) {
+                       LOG.warn("Unexpected exception",e);
+                    } finally {
+                       follower.shutdown();
+                       setFollower(null);
+                       updateServerState();
+                    }
+                    break;
+                case LEADING:
+                    LOG.info("LEADING");
+                    try {
+                        // 当前节点启动模式为Leader。
+                        setLeader(makeLeader(logFactory));
+                        // 发送自己成为leader的通知。
+                        leader.lead();
+                        setLeader(null);
+                    } catch (Exception e) {
+                        LOG.warn("Unexpected exception",e);
+                    } finally {
+                        if (leader != null) {
+                            leader.shutdown("Forcing shutdown");
+                            setLeader(null);
+                        }
+                        updateServerState();
+                    }
+                    break;
+                }
+                start_fle = Time.currentElapsedTime();
+            }
+        } finally {
+            LOG.warn("QuorumPeer main thread exited");
+            MBeanRegistry instance = MBeanRegistry.getInstance();
+            instance.unregister(jmxQuorumBean);
+            instance.unregister(jmxLocalPeerBean);
+
+            for (RemotePeerBean remotePeerBean : jmxRemotePeerBean.values()) {
+                instance.unregister(remotePeerBean);
+            }
+
+            jmxQuorumBean = null;
+            jmxLocalPeerBean = null;
+            jmxRemotePeerBean = null;
+        }
+    }
+```
+
+节点初始化的状态为 LOOKING，因此启动时直接会调用 lookForLeader 方法发起 Leader 选举，org.apache.zookeeper.server.quorum.FastLeaderElection#lookForLeader
+
+```java
+
+```
+
+经过上⾯的发起投票，统计投票信息最终每个节点都会确认⾃⼰的身份，节点根据类型的不同会执⾏以
+下逻辑：
+
+1. 如果是 Leader 节点，首先会想其他节点发送⼀条 NEWLEADER 信息，确认自己的身份，等到各个节点的ACK消息以后开始正式对外提供服务，同时开启新的监听器，处理新节点加⼊的逻辑。
+2. 如果是 Follower 节点，首先向 Leader 节点发送⼀条 FOLLOWERINFO 信息，告诉 Leader 节点自己已处理的事务的最大 Zxid，然后 Leader 节点会根据自己的最大 Zxid 与 Follower 节点进⾏同步，如果 Follower 节点落后的不多则会收到 Leader 的 DIFF 信息通过内存同步，如果 Follower 节点落后的很多则会收到 SNAP 通过快照同步，如果 Follower 节点的 Zxid 大于 Leader 节点则会收到 TRUNC 信息忽略多余的事务。
+3. 如果是Observer节点，则与Follower节点相同。
+
+
+
